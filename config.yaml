@@ -1,0 +1,8 @@
+ASSISTANT_NAME: Amadou # Not customizable at the moment
+WAKE_WORD: Amadou # Not customizable at the moment
+ASSISTANT_PURPOSE: Cooking Assistant
+RESPONSE_LANGUAGE: fr
+USE_WHISPER_API: true
+OPENAI_MODEL: gpt-4o-mini
+ENABLE_TTS: true
+TTS_VOICE: "onyx" # Optional: Specify the default voice

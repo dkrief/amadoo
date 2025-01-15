@@ -1,0 +1,9 @@
+openai
+PyQt5
+pyaudio
+pocketsphinx
+whisper
+python-dotenv
+pyqtgraph
+pydub
+webrtcvad
