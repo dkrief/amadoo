@@ -8,6 +8,7 @@ import struct
 import math
 import threading
 import random
+from typing import List, Dict, Any, Iterable
 from pydub import AudioSegment
 from pydub.playback import play
 import tempfile
@@ -15,14 +16,17 @@ import wave
 import yaml
 from PyQt5.QtCore import pyqtSlot, pyqtSignal, Qt, QMetaObject, Q_ARG, QEvent, QTimer, QRectF, QPropertyAnimation, QEasingCurve
 import traceback
-from openai import AsyncOpenAI, OpenAI
+
+# IMPORTANT: replaces direct “chat” usage with the new “beta.threads” usage
+from openai import OpenAI
+import openai as openai_global
+
 import webrtcvad
 
 import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtWidgets  # or PySide2
 from pocketsphinx import Pocketsphinx
 from dotenv import load_dotenv
-import openai
 import pyaudio
 
 # Import Whisper only if needed locally
@@ -31,7 +35,7 @@ try:
 except ImportError:
     whisper = None
 
-# Load environment variables from .env, including OPENAI_API_KEY if needed for ChatCompletion
+# Load environment variables from .env, including OPENAI_API_KEY if needed
 load_dotenv()
 
 #####################################################
@@ -39,7 +43,7 @@ load_dotenv()
 #####################################################
 
 BACKGROUND_COLOR_HEX = "#000"      # Black
-DOMINANT_COLOR_HEX = "#52C2B1"    # Dominant color for the text and swirl
+DOMINANT_COLOR_HEX = "#52C2B1"    # Dominant color for text and swirl
 
 BACKGROUND_COLOR = QtGui.QColor(BACKGROUND_COLOR_HEX)
 DOMINANT_COLOR = QtGui.QColor(DOMINANT_COLOR_HEX)
@@ -76,67 +80,66 @@ WAKE_WORD = config['WAKE_WORD'].lower()
 RESPONSE_LANGUAGE = config['RESPONSE_LANGUAGE'].lower()
 USE_WHISPER_API = config['USE_WHISPER_API']
 ASSISTANT_PURPOSE = config['ASSISTANT_PURPOSE']
-OPENAI_MODEL = config.get('OPENAI_MODEL', 'gpt-4o')
+OPENAI_MODEL = config.get('OPENAI_MODEL', 'gpt-4o-mini')
 
 # TTS Configuration
 ENABLE_TTS = config.get('ENABLE_TTS', False)
-TTS_VOICE = config.get('TTS_VOICE', 'alloy')  # Default to 'alloy'
+TTS_VOICE = config.get('TTS_VOICE', 'alloy')  # Default voice
 
-if ASSISTANT_NAME.lower() != "amadou" or WAKE_WORD != "amadou":
-    raise NotImplementedError("Assistant name and wake word can only be 'Amadou'.")
-
+if ASSISTANT_NAME.lower() != "amadoo" or WAKE_WORD != "amadou":
+    raise NotImplementedError("Assistant name and wake word must both be 'Amadou' for this example.")
 
 print(OPENAI_MODEL)
 print(f"TTS Enabled: {ENABLE_TTS}, Voice: {TTS_VOICE}")
-
 
 # Make sure we have an OpenAI API key
 if not os.getenv("OPENAI_API_KEY"):
     raise ValueError("OPENAI_API_KEY is not set in the environment variables.")
 
+# Create a global OpenAI client
+# NOTE: For the new beta.threads endpoints, you can still use the same main client.
 OPENAI_CLIENT = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-
 #####################################################
-# Part 1: Setup for Pocketsphinx Wake Word Detection
+# 1. Basic config for Pocketsphinx Wake Word Detection
 #####################################################
 
-# Define paths to acoustic models based on language
 LANGUAGE_MODELS = {
     "fr": {
         "acoustic_model_dir": os.path.join(os.getcwd(), "models", "fr-ptm-5.2"),
         "dictionary_path": os.path.join(os.getcwd(), "models", "fr.dict"),
         "kws_file_path": os.path.join(os.getcwd(), "models", "kws.list"),
         "kws_file_path_strict": os.path.join(os.getcwd(), "models", "kws2.list"),
-        "error_sentence": "Désole, je n'ai pas pu traiter votre demande."
+        "error_sentence": "Désole, je n'ai pas pu traiter votre demande.",
+        "name": "French",
     },
     "en": {
         "acoustic_model_dir": os.path.join(os.getcwd(), "models", "en-us"),
         "dictionary_path": os.path.join(os.getcwd(), "models", "cmudict-en-us.dict"),
         "kws_file_path": os.path.join(os.getcwd(), "models", "kws_en.list"),
         "kws_file_path_strict": os.path.join(os.getcwd(), "models", "kws2_en.list"),
-        "error_sentence": "Sorry, I couldn't process your request."
+        "error_sentence": "Sorry, I couldn't process your request.",
+        "name": "English",
     }
 }
-
 
 if RESPONSE_LANGUAGE not in LANGUAGE_MODELS:
     raise ValueError(f"Unsupported language: {RESPONSE_LANGUAGE}")
 
-selected_model = LANGUAGE_MODELS[RESPONSE_LANGUAGE]
-acoustic_model_dir = selected_model["acoustic_model_dir"]
-dictionary_path = selected_model["dictionary_path"]
-kws_file_path = selected_model["kws_file_path"]
-kws_file_path_strict = selected_model["kws_file_path_strict"]
+selected_lang_dict = LANGUAGE_MODELS[RESPONSE_LANGUAGE]
+acoustic_model_dir = selected_lang_dict["acoustic_model_dir"]
+dictionary_path = selected_lang_dict["dictionary_path"]
+kws_file_path = selected_lang_dict["kws_file_path"]
+kws_file_path_strict = selected_lang_dict["kws_file_path_strict"]
 
 # Define global audio constants
 CHUNK = 512
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
-AMPLITUDE_SMOOTHING = 0.23  # Adjust between 0.0 (no smoothing) and 1.0 (high smoothing)
-SILENCE_PADDING_DURATION_MS = 300  # Duration to wait after speech ends (in milliseconds)
-VAD_AGGRESSIVENESS = 3           # VAD aggressiveness mode (0-3)
+AMPLITUDE_SMOOTHING = 0.23
+SILENCE_PADDING_DURATION_MS = 300
+VAD_AGGRESSIVENESS = 3
 
 # Pocketsphinx config for tolerant detection
 ps_config = {
@@ -148,8 +151,27 @@ ps_config = {
     "kws_threshold": 1e-30,  # Tolerant threshold
 }
 
+
 #####################################################
-# Part 1.1: Audio and Transcription Utilities
+# 1.0: Using beta.threads from the new library
+#####################################################
+
+ACTIVE_THREAD = None
+
+openai_assistant = OPENAI_CLIENT.beta.assistants.create(
+    instructions=f"You are a **{ASSISTANT_PURPOSE}** Your name is '{ASSISTANT_NAME}'.\nAlways respond in **{selected_lang_dict["name"]}** even if the user speaks another language.",
+    name=ASSISTANT_PURPOSE,
+    tools=[],
+    model=OPENAI_MODEL,
+    temperature=0.2
+)
+
+ASSISTANT_ID = openai_assistant.id
+if not ASSISTANT_ID:
+    raise ValueError("Assistant creation failed. Please check your OpenAI API key and configuration.")
+
+#####################################################
+# 1.1: Audio and Transcription Utilities
 #####################################################
 
 
@@ -201,9 +223,7 @@ def listen_for_potential_wake(pa):
 
 
 def save_audio_buffer(audio_buffer, file_path, sample_rate=16000, channels=1, sample_format=pyaudio.paInt16):
-    """
-    Saves the audio buffer (bytes) to a WAV file for debugging.
-    """
+    """Saves the audio buffer (bytes) to a WAV file for debugging."""
     try:
         pa_temp = pyaudio.PyAudio()
         sample_width = pa_temp.get_sample_size(sample_format)
@@ -291,9 +311,6 @@ def confirm_wake_word(pa, buffered_audio, additional_time=0.3, debug_save_file="
 def record_command(pa, aggressiveness=2, frame_duration=30, padding_duration=300):
     """
     Records audio until silence is detected using Voice Activity Detection (VAD).
-    aggressiveness: VAD aggressiveness mode (0-3)
-    frame_duration: duration of a frame in ms
-    padding_duration: duration of padding in ms after speech stops
     """
     vad = webrtcvad.Vad()
     vad.set_mode(aggressiveness)
@@ -336,7 +353,7 @@ def record_command(pa, aggressiveness=2, frame_duration=30, padding_duration=300
                     break
                 frames.append(frame)
             else:
-                # Not speaking and no speech before
+                # Not speaking, do nothing
                 pass
     except KeyboardInterrupt:
         print("KeyboardInterrupt caught in record_command.")
@@ -378,25 +395,25 @@ def transcribe_audio(wav_path):
         print("Transcribing using Whisper API endpoint...")
         try:
             with open(wav_path, "rb") as audio_file:
-                transcription = openai.audio.transcriptions.create(
+                transcription = openai_global.audio.transcriptions.create(
                     model="whisper-1",
                     file=audio_file,
                     response_format="text"
                 )
-            # Attempt to handle different response shapes
+            # The new library’s types sometimes come back as a dict
             if hasattr(transcription, "text"):
                 return transcription.text
             elif isinstance(transcription, dict) and "text" in transcription:
                 return transcription["text"]
             else:
-                return transcription
+                return str(transcription)
         except Exception as e:
             print(f"Error during transcription via API: {e}")
             return ""
     else:
         # Use local Whisper
         if whisper is None:
-            raise ImportError("Please install the Whisper package or enable USE_WHISPER_API.")
+            raise ImportError("Please install the Whisper package or use USE_WHISPER_API.")
         try:
             print("Loading local Whisper model 'turbo'...")
             model = whisper.load_model("turbo")
@@ -407,36 +424,13 @@ def transcribe_audio(wav_path):
             return ""
 
 
-def get_chat_completion(prompt):
-    """
-    Uses OpenAI ChatCompletion API to generate a GPT response.
-    """
-    print("Getting GPT response...")
-    full_prompt = (
-        f"You are a **{ASSISTANT_PURPOSE}** Your name is 'Amadou'.",
-        f"Always respond in **{RESPONSE_LANGUAGE}** even if the user speaks another language.",
-        f"User says: '{prompt}'"
-    )
-    try:
-        openai_response = OPENAI_CLIENT.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role": "user", "content": " ".join(full_prompt)}],
-            max_tokens=400,
-            temperature=0.5,
-        )
-        return openai_response.choices[0].message.content
-    except Exception as e:
-        print(f"Error getting chat completion: {e}")
-        return "Désolé, je n'ai pas pu traiter votre demande."
-
-#####################################################
-# Part 1.2: A Brief, Soothing Sound
-#####################################################
-
+###################################################################
+# 1.2: Soothing beep or wave playback
+###################################################################
 
 def play_wave_file(file_path):
     """
-    Plays a .wav audio file using PyAudio.
+    Plays a .wav file using PyAudio.
     """
     chunk = 1024
     wf = wave.open(file_path, 'rb')
@@ -457,10 +451,10 @@ def play_wave_file(file_path):
     stream.stop_stream()
     stream.close()
 
-#####################################################
-# Part 2: Enhanced Visualization
-#####################################################
 
+#####################################################
+# 2: Enhanced Visualization (swirling dots, etc.)
+#####################################################
 
 class Dot:
     def __init__(self, angle, distance, width, height, rotation, color):
@@ -503,9 +497,6 @@ class DotsLayer:
         return dots
 
     def update(self, amplitude):
-        """
-        Update each dot's distance based on amplitude (so they expand/contract).
-        """
         self.current_amp = amplitude
         expansion = self.max_extra * amplitude
         for dot in self.dots:
@@ -513,7 +504,6 @@ class DotsLayer:
 
     def draw(self, painter, overall_alpha):
         for dot in self.dots:
-            # Scale dot distance by painter scale, so amplitude "breathes" continuously
             x = dot.distance * math.cos(dot.angle)
             y = dot.distance * math.sin(dot.angle)
             scaled_width = dot.width * (1.0 + 0.5 * self.current_amp)
@@ -523,14 +513,14 @@ class DotsLayer:
             painter.translate(x, y)
             painter.rotate(dot.rotation)
 
-            # Adjust alpha according to the current state
+            # Adjust alpha for state
             dot_color = QtGui.QColor(dot.color)
             dot_color.setAlpha(overall_alpha)
 
             # Halo
             halo_size = max(scaled_width, scaled_height) * 1.5
             halo_color = QtGui.QColor(dot_color)
-            halo_color.setAlpha(int(0.2 * overall_alpha))  # a fraction for the halo
+            halo_color.setAlpha(int(0.2 * overall_alpha))
             painter.setBrush(QtGui.QBrush(halo_color))
             painter.setPen(QtCore.Qt.NoPen)
             painter.drawEllipse(QtCore.QPointF(0, 0), halo_size, halo_size)
@@ -545,43 +535,33 @@ class DotsLayer:
 
 class DotsBowlItem(QtWidgets.QGraphicsObject):
     """
-    Visualization of multiple layers of dots arranged in circular patterns,
-    expanding with the audio amplitude. Handles states for transparency,
-    scale, and swirling (rotation).
+    Visualization of multiple layers of expanding/shrinking dots,
+    plus swirling animation and “states.”
     """
 
     def __init__(self, layers=5, dots_per_layer=100, parent=None):
         super(DotsBowlItem, self).__init__(parent)
         self.setAcceptedMouseButtons(Qt.NoButton)
 
-        # Real-time amplitude from mic
         self.amplitude = 0.0
-        # Layers for the normal bowl
         self.layers = []
 
-        # State can be "LISTENING", "AWAKENED", or "GPT_LOADING"
+        # State: "LISTENING", "AWAKENED", "GPT_LOADING"
         self.state = "LISTENING"
 
-        # Scale factor property
+        # Visual properties
         self._scaleFactor = 1.0
-        # Dot alpha property (0 = fully transparent, 255 = fully opaque)
-        self._dotAlpha = 128  # Start with semi-transparent
-
-        # For swirling animation
+        self._dotAlpha = 128
         self.isSwirling = False
         self.swirlTimer = None
         self.swirlAngle = 0.0
-
-        # Animation reference to prevent garbage collection
         self.current_animation = None
 
-        # Build the layers
         self.init_layers(layers, dots_per_layer)
 
-        # Timer for chaotic movement
         self.chaotic_timer = QtCore.QTimer()
         self.chaotic_timer.timeout.connect(self.apply_chaotic_movement)
-        self.chaotic_movement_intensity = 5.0  # Adjust as needed for desired effect
+        self.chaotic_movement_intensity = 5.0  # random “shake”
 
     def init_layers(self, num_layers, dots_per_layer):
         color_palettes = [
@@ -603,86 +583,68 @@ class DotsBowlItem(QtWidgets.QGraphicsObject):
             )
             self.layers.append(layer)
 
-    # ----------------------
     # QGraphicsItem overrides
-    # ----------------------
     def boundingRect(self):
         max_radius = 0
         for lyr in self.layers:
             candidate = lyr.base_radius + lyr.max_extra
             if candidate > max_radius:
                 max_radius = candidate
-        # Multiply by 1.5 to accommodate scaling
         max_radius *= 1.5
         return QRectF(-max_radius, -max_radius, 2 * max_radius, 2 * max_radius)
 
     def paint(self, painter, option, widget):
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
-
-        # Apply scale
         painter.save()
         painter.scale(self._scaleFactor, self._scaleFactor)
-
-        # If swirling, rotate
         if self.isSwirling:
             painter.rotate(self.swirlAngle)
-
-        # Each layer draws with the current alpha
         effective_amp = self.amplitude
         for layer in self.layers:
             layer.update(effective_amp)
             layer.draw(painter, overall_alpha=self._dotAlpha)
-
         painter.restore()
 
-    # -----------------------------
-    # Property Definitions
-    # -----------------------------
-    @QtCore.pyqtProperty(float)
+    # Scale property
+    @ QtCore.pyqtProperty(float)
     def scaleFactor(self):
         return self._scaleFactor
 
-    @scaleFactor.setter
+    @ scaleFactor.setter
     def scaleFactor(self, value):
         self._scaleFactor = value
         self.update()
 
-    @QtCore.pyqtProperty(int)
+    # Alpha property
+    @ QtCore.pyqtProperty(int)
     def dotAlpha(self):
         return self._dotAlpha
 
-    @dotAlpha.setter
+    @ dotAlpha.setter
     def dotAlpha(self, value):
         self._dotAlpha = value
         self.update()
 
     def updateAmplitude(self, amp):
-        """
-        Called by AudioProcessor's signal to update amplitude in real-time.
-        """
         if self.state == "GPT_LOADING":
-            # Ignore amplitude updates during GPT_LOADING state
+            # ignore amplitude updates in that state
             return
         self.amplitude = amp
         self.update()
 
-    # --------------------------------
-    # Swirl (rotation) control
-    # --------------------------------
+    # Swirl movement
     def startSwirl(self):
         if self.swirlTimer:
             self.swirlTimer.stop()
         self.isSwirling = True
         self.swirlAngle = 0.0
-
         self.swirlTimer = QtCore.QTimer()
         self.swirlTimer.timeout.connect(self._updateSwirl)
-        self.swirlTimer.start(30)  # ~33 fps
+        self.swirlTimer.start(30)
 
     def _updateSwirl(self):
         if not self.isSwirling:
             return
-        # Rotate by a small increment
         self.swirlAngle += 3.0
         self.update()
 
@@ -691,89 +653,60 @@ class DotsBowlItem(QtWidgets.QGraphicsObject):
         if self.swirlTimer:
             self.swirlTimer.stop()
 
-    # --------------------------------
-    # State management
-    # --------------------------------
+    # State transitions
     def setState(self, new_state):
-        """
-        Transitions the bowl to a new state:
-         - LISTENING: dot alpha=128, scale=1.0, no swirl
-         - AWAKENED: animate alpha from 128->255, scale from 1.0->1.5 over 500ms and start chaotic movement
-         - GPT_LOADING: start swirling animation without changing alpha or scale
-        """
         self.state = new_state
         if new_state == "LISTENING":
             self.stopSwirl()
             self.chaotic_timer.stop()
-            # Animate alpha from current to 128 and scale from current to 1.0
+            # Animate alpha->128, scale->1.0
             self.animateScaleAndAlpha(0, 1.2, self._dotAlpha, 60, 60)
             self.update()
 
         elif new_state == "AWAKENED":
-            self.stopSwirl()  # No swirl while just awakened
-            self.chaotic_timer.start(50)  # Update every 50ms
-            # Animate alpha from 128 -> 255, scale from 1.0 -> 1.5
+            self.stopSwirl()
+            self.chaotic_timer.start(50)
+            # Animate alpha 128->255, scale 1.0->1.5
             self.animateScaleAndAlpha(1.0, 1.5, 128, 255, 500)
 
         elif new_state == "GPT_LOADING":
-            self.chaotic_timer.stop()  # Stop chaotic movement during loading
-            self.startSwirl()          # Start swirling animation
-            # Optionally reset amplitude to prevent residual effects
+            self.chaotic_timer.stop()
+            self.startSwirl()
             self.amplitude = 0.0
             self.update()
 
     def animateScaleAndAlpha(self, startScale, endScale, startAlpha, endAlpha, duration=500):
-        """
-        Helper to animate scaleFactor and dotAlpha in parallel over 'duration' ms.
-        """
-        # Stop any ongoing animation
         if self.current_animation is not None:
             self.current_animation.stop()
-
-        # Create a parallel animation group
         group = QtCore.QParallelAnimationGroup(self)
 
-        # Scale animation
         scaleAnim = QPropertyAnimation(self, b"scaleFactor")
         scaleAnim.setStartValue(startScale)
         scaleAnim.setEndValue(endScale)
         scaleAnim.setDuration(duration)
         scaleAnim.setEasingCurve(QEasingCurve.InOutCubic)
 
-        # Alpha animation
         alphaAnim = QPropertyAnimation(self, b"dotAlpha")
         alphaAnim.setStartValue(startAlpha)
         alphaAnim.setEndValue(endAlpha)
         alphaAnim.setDuration(duration)
         alphaAnim.setEasingCurve(QEasingCurve.InOutCubic)
 
-        # Add animations to the group
         group.addAnimation(scaleAnim)
         group.addAnimation(alphaAnim)
-
-        # Connect the finished signal to clear the reference
         group.finished.connect(lambda: setattr(self, 'current_animation', None))
-
-        # Store the reference to prevent garbage collection
         self.current_animation = group
-
-        # Start the animation
         group.start()
 
     def apply_chaotic_movement(self):
         if self.state != "AWAKENED":
             return
-
         for layer in self.layers:
             for dot in layer.dots:
-                # Apply small random perturbations to the angle
-                angle_perturb = random.uniform(-0.05, 0.05)  # radians
+                angle_perturb = random.uniform(-0.05, 0.05)
                 dot.angle += angle_perturb
-
-                # Apply small perturbations to distance for vibrational effect
                 distance_perturb = random.uniform(-1.0, 1.0) * self.chaotic_movement_intensity
                 dot.distance = dot.init_distance + distance_perturb
-
         self.update()
 
 
@@ -791,39 +724,25 @@ class MyGraphicsScene(QtWidgets.QGraphicsScene):
 
 def generate_speech(text, voice=TTS_VOICE):
     """
-    Generates speech audio from text using OpenAI's TTS API.
-
-    Args:
-        text (str): The text to convert to speech.
-        voice (str): The voice to use for TTS.
-
-    Returns:
-        str: Path to the generated speech audio file.
+    Generates speech audio from text using OpenAI's TTS API with the new library.
     """
     if not ENABLE_TTS:
         print("TTS is disabled in the configuration.")
         return None
 
     try:
-        # Initialize OpenAI client if not already
-        openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-        # Generate speech
-        mp3 = openai_client.audio.speech.create(
+        mp3 = OPENAI_CLIENT.audio.speech.create(
             model="tts-1",
             voice=voice,
-            input=text,
+            input=text
         )
-
-        # Save the audio to a temporary file
+        # Save to temp file
         buffer = mp3.read()
         speech_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         with open(speech_file.name, "wb") as f:
             f.write(buffer)
-
         print(f"Speech audio generated at: {speech_file.name}")
         return speech_file.name
-
     except Exception as e:
         print(f"Error generating speech: {e}")
         return None
@@ -832,9 +751,6 @@ def generate_speech(text, voice=TTS_VOICE):
 def play_mp3_file(file_path):
     """
     Plays an MP3 file using pydub.
-
-    Args:
-        file_path (str): Path to the MP3 file.
     """
     try:
         audio = AudioSegment.from_mp3(file_path)
@@ -844,15 +760,14 @@ def play_mp3_file(file_path):
     except FileNotFoundError:
         print(f"MP3 file not found: {file_path}")
     except ImportError:
-        print("pydub is not installed. Please install it using 'pip install pydub'.")
+        print("pydub is not installed. Please install with 'pip install pydub'.")
     except Exception as e:
         print(f"Error playing MP3 file: {e}")
 
 
 #####################################################
-# Part 2.1: Audio Processor for Amplitude
+# 2.1: Audio Processor for amplitude display
 #####################################################
-
 
 class AudioProcessor(QtCore.QObject):
     amplitude_signal = pyqtSignal(float)
@@ -862,7 +777,8 @@ class AudioProcessor(QtCore.QObject):
         self.running = True
         self.pa = pa
         self.smoothed_amp = 0.0
-        self.smoothing = smoothing  # This will now be set from config
+        self.smoothing = smoothing
+        self.stream = None
 
     def start(self):
         try:
@@ -877,7 +793,6 @@ class AudioProcessor(QtCore.QObject):
             print(f"Failed to open audio stream in AudioProcessor: {e}")
             self.running = False
             return
-
         threading.Thread(target=self.process_audio, daemon=True).start()
 
     def stop(self):
@@ -904,10 +819,8 @@ class AudioProcessor(QtCore.QObject):
                 continue
 
             amplitude = self.compute_rms(data)
-            # Normalize roughly
             current_amp = min(amplitude / 3000, 1.0)
 
-            # Exponential smoothing
             self.smoothed_amp += self.smoothing * (current_amp - self.smoothed_amp)
             self.amplitude_signal.emit(self.smoothed_amp)
 
@@ -927,35 +840,26 @@ class AudioProcessor(QtCore.QObject):
         rms = math.sqrt(sum_squares / count)
         return rms
 
-#####################################################
-# Part 2.2: A scrollable overlay to show GPT text
-#####################################################
 
-
+#####################################################
+# 2.2: A scrollable overlay to show GPT text
+#####################################################
 class ResponseOverlayWidget(QtWidgets.QWidget):
-    """
-    An overlay that appears on top of the main window content,
-    showing the GPT response with progressive "streaming" text,
-    a scrollbar, and a close button.
-    """
-
     closed_signal = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet("""
             QWidget {
-                background-color: rgba(0, 0, 0, 220); /* semi-transparent black */
+                background-color: rgba(0, 0, 0, 220);
             }
         """)
         self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
 
-        # Increase padding around entire overlay
         self.layout = QtWidgets.QVBoxLayout(self)
         self.layout.setContentsMargins(20, 20, 20, 20)
         self.layout.setSpacing(0)
 
-        # Close button at top-right
         self.close_button = QtWidgets.QPushButton("✕")
         self.close_button.setStyleSheet("""
             QPushButton {
@@ -974,24 +878,18 @@ class ResponseOverlayWidget(QtWidgets.QWidget):
         self.close_button.setFixedHeight(30)
         self.close_button.clicked.connect(self.on_close_clicked)
 
-        # A small horizontal layout for the close button (aligned right)
         top_layout = QtWidgets.QHBoxLayout()
         top_layout.addStretch()
         top_layout.addWidget(self.close_button)
-
         self.layout.addLayout(top_layout)
 
-        # Scroll area
         self.scroll_area = QtWidgets.QScrollArea()
-        # Remove border and make it fully transparent:
         self.scroll_area.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         self.scroll_area.setWidgetResizable(True)
         self.layout.addWidget(self.scroll_area)
 
-        # Inside the scroll area: a widget with QVBoxLayout
         self.content_widget = QtWidgets.QWidget()
         self.content_layout = QtWidgets.QVBoxLayout(self.content_widget)
-        # Additional padding inside
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content_layout.setSpacing(0)
 
@@ -999,21 +897,17 @@ class ResponseOverlayWidget(QtWidgets.QWidget):
         self.label.setStyleSheet(f"QLabel {{ color: {DOMINANT_COLOR_HEX}; font-size: 24px; }}")
         self.label.setWordWrap(True)
         self.label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-
-        # Ensure label expands
-        self.label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        self.scroll_area.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-
         font = QtGui.QFont()
         font.setPointSize(24)
         self.label.setFont(font)
 
+        self.label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.scroll_area.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.content_layout.addWidget(self.label)
-        self.content_layout.addStretch()  # push text to the top
+        self.content_layout.addStretch()
 
         self.scroll_area.setWidget(self.content_widget)
 
-        # For progressive text
         self.full_text = ""
         self.displayed_text = ""
         self.char_index = 0
@@ -1021,7 +915,6 @@ class ResponseOverlayWidget(QtWidgets.QWidget):
         self.timer.timeout.connect(self.stream_text)
         self.setGeometry(parent.rect())
 
-        # For fade animations
         self._fade_anim = None
 
     def on_close_clicked(self):
@@ -1033,12 +926,8 @@ class ResponseOverlayWidget(QtWidgets.QWidget):
         self.closed_signal.emit()
 
     def fadeOut(self, duration_ms=300):
-        """
-        Fades out the overlay over duration_ms, then closes it.
-        """
         if self._fade_anim:
             self._fade_anim.stop()
-
         self._fade_anim = QPropertyAnimation(self, b"windowOpacity")
         self._fade_anim.setDuration(duration_ms)
         self._fade_anim.setStartValue(1.0)
@@ -1047,58 +936,50 @@ class ResponseOverlayWidget(QtWidgets.QWidget):
         self._fade_anim.finished.connect(self.closeOverlay)
         self._fade_anim.start()
 
+    @pyqtSlot(str)
     def startOverlay(self, text):
-        """
-        Show the overlay, reset opacity to 1.0, and begin progressive text streaming.
-        """
-        # Cancel any ongoing fade
         if self._fade_anim:
             self._fade_anim.stop()
         self.setWindowOpacity(1.0)
-
-        # Add disclosure if TTS is enabled
-        if ENABLE_TTS:
-            disclaimer = "Note: The following audio is generated by AI."
-            full_display_text = f"{text}\n\n{disclaimer}"
-        else:
-            full_display_text = text
-
-        self.full_text = full_display_text
+        self.full_text = text
         self.displayed_text = ""
         self.char_index = 0
         self.label.setText("")
-        self.show()  # ensure widget is visible
-
-        # Start streaming
+        self.show()
         self.timer.start(20)
 
+    @pyqtSlot(str)
+    def appendOverlay(self, new_text):
+        """
+        Appends new_text to the existing displayed_text and updates the label.
+        """
+        self.full_text += new_text
+        self.timer.stop()  # Stop any ongoing animation
+        self.displayed_text = self.full_text
+        self.label.setText(self.displayed_text)
+        self.scroll_area.verticalScrollBar().setValue(
+            self.scroll_area.verticalScrollBar().maximum()
+        )
+
     def stream_text(self):
-        """
-        Add a small chunk of text each step, with some random jitter in speed.
-        """
-        # random chunk size
         chunk_size = random.randint(2, 4)
         if self.char_index < len(self.full_text):
             next_index = min(self.char_index + chunk_size, len(self.full_text))
             self.displayed_text += self.full_text[self.char_index:next_index]
             self.char_index = next_index
             self.label.setText(self.displayed_text)
-
-            # Make the text scroll to bottom with each addition
             self.scroll_area.verticalScrollBar().setValue(
                 self.scroll_area.verticalScrollBar().maximum()
             )
-
-            # Randomize the next timer interval to vary speeds
             new_interval = random.randint(10, 30)
             self.timer.setInterval(new_interval)
         else:
             self.timer.stop()
 
-#####################################################
-# Part 2.3: Main Window
-#####################################################
 
+#####################################################
+# 2.3: Main Window
+#####################################################
 
 class SoundBowlWindow(QtWidgets.QMainWindow):
     def __init__(self, pa):
@@ -1125,63 +1006,46 @@ class SoundBowlWindow(QtWidgets.QMainWindow):
         self.view.setScene(self.scene)
         layout.addWidget(self.view)
 
-        # Create the dot bowl
         self.dots_bowl = DotsBowlItem(layers=5, dots_per_layer=200)
         self.scene.addItem(self.dots_bowl)
-        # Center it (adjust as per your window size)
         self.dots_bowl.setPos(400, 400)
 
-        # Initialize AudioProcessor
         self.audio = AudioProcessor(pa)
         self.audio.amplitude_signal.connect(self.dots_bowl.updateAmplitude)
         self.audio.start()
 
-        # Ensure the initial state is LISTENING
         self.dots_bowl.setState("LISTENING")
 
-        # Overlay to show GPT response
         self.response_overlay = ResponseOverlayWidget(self)
         self.response_overlay.hide()
         self.response_overlay.closed_signal.connect(self.on_overlay_closed)
 
-    @pyqtSlot()
+    @ pyqtSlot()
     def wakeWordDetected(self):
-        """
-        Called from the assistant thread to trigger "Awakened" animation + beep.
-        Also fade out any currently displayed text.
-        """
+        # Called from background thread => show "AWAKENED"
         print("wakeWordDetected slot called in GUI.")
 
-        # If text is visible, fade it out
         if self.response_overlay.isVisible():
             self.response_overlay.fadeOut(300)
 
         self.dots_bowl.setState("AWAKENED")
-        play_wave_file("amadou.wav")
+        play_wave_file("sounds/yes.wav")
 
-    @pyqtSlot()
+    @ pyqtSlot()
     def startGptLoading(self):
-        """
-        Called from the assistant thread once we start calling GPT => swirl.
-        Also play the 'whirling' sound.
-        """
         print("Starting GPT loading state.")
         self.dots_bowl.setState("GPT_LOADING")
-        play_wave_file("ok.wav")  # <--- New sound before loading
+        play_wave_file("sounds/ok.wav")
 
-    @pyqtSlot(str)
+    @ pyqtSlot(str)
     def showGPTResponse(self, text):
-        """
-        Called from the assistant thread once GPT has responded.
-        The bowl should go back to listening mode behind text, and we show the overlay.
-        """
-        # Set state back to LISTENING
+        # Switch back to LISTENING
         self.dots_bowl.setState("LISTENING")
 
-        # Show the GPT response overlay
+        # Show overlay
         self.response_overlay.startOverlay(text)
 
-        # Generate and play speech if TTS is enabled
+        # If TTS is enabled, play speech
         if ENABLE_TTS:
             speech_file = generate_speech(text, voice=TTS_VOICE)
             if speech_file:
@@ -1189,142 +1053,104 @@ class SoundBowlWindow(QtWidgets.QMainWindow):
             else:
                 print("Failed to generate speech audio.")
 
-    @pyqtSlot()
+    @ pyqtSlot()
     def wakeWordDetectedDuringLoading(self):
-        """
-        Called from the assistant thread if a wake word is detected during GPT loading.
-        Fades out any existing text if shown.
-        """
-        print("wakeWordDetectedDuringLoading slot called in GUI.")
-
+        print("wakeWordDetectedDuringLoading triggered in GUI.")
         if self.response_overlay.isVisible():
             self.response_overlay.fadeOut(300)
-
         self.dots_bowl.setState("AWAKENED")
-        play_wave_file("amadou.wav")
+        play_wave_file("sounds/yes.wav")
 
     def on_overlay_closed(self):
-        """
-        Called when overlay is closed by the user. The bowl is already in listening mode.
-        """
         pass
 
     def closeEvent(self, event):
         self.audio.stop()
         event.accept()
 
-#####################################################
-# Part 3: Assistant Thread + Main Entry
-#####################################################
 
+def create_or_continue_thread():
+    global ACTIVE_THREAD
+    # If overlay was closed => we start new
+    if ACTIVE_THREAD is None:
 
-def assistant_loop(window, pa, interrupt_event):
-    print(f"{ASSISTANT_NAME} started. Listening for wake word: '{WAKE_WORD}'")
-    try:
-        while True:
-            buffered_audio = listen_for_potential_wake(pa)
-            if buffered_audio is None:
-                print("Failed to capture buffered audio. Restarting loop.")
-                continue
-
-            print("Potential wake word detected. Confirming...")
-            if confirm_wake_word(pa, buffered_audio, additional_time=0.2):
-                print("Wake word confirmed! I'm awake!")
-                # Animate & beep in GUI
-                QMetaObject.invokeMethod(
-                    window,
-                    "wakeWordDetected",
-                    Qt.QueuedConnection
-                )
-
-                # Record the user command using VAD
-                recorded_wav = record_command(
-                    pa,
-                    aggressiveness=VAD_AGGRESSIVENESS,        # Use the configurable aggressiveness
-                    frame_duration=30,                        # You can also make this configurable if needed
-                    padding_duration=SILENCE_PADDING_DURATION_MS  # Use the configurable padding duration
-                )
-                if recorded_wav is None:
-                    print("Failed to record command. Returning to listen mode.")
-                    window.dots_bowl.setState("LISTENING")  # Ensure state is reset
-                    continue
-
-                user_text = transcribe_audio(recorded_wav)
-                print(f"User said: {user_text}")
-
-                # Let the GUI know we are loading GPT => swirl
-                QMetaObject.invokeMethod(
-                    window,
-                    "startGptLoading",
-                    Qt.QueuedConnection
-                )
-
-                # Reset the interrupt event before starting GPT processing
-                interrupt_event.clear()
-
-                # Start GPT processing in a separate thread
-                gpt_thread = threading.Thread(
-                    target=process_gpt,
-                    args=(user_text, window, interrupt_event),
-                    daemon=True
-                )
-                gpt_thread.start()
-
-                # Start listening for wake word during GPT loading in a separate thread
-                wake_during_gpt_thread = threading.Thread(
-                    target=listen_for_wake_during_gpt,
-                    args=(pa, interrupt_event),
-                    daemon=True
-                )
-                wake_during_gpt_thread.start()
-
-                # Wait for GPT thread to finish or interruption
-                while gpt_thread.is_alive():
-                    if interrupt_event.is_set():
-                        print("GPT loading interrupted by wake word.")
-                        QMetaObject.invokeMethod(
-                            window,
-                            "wakeWordDetectedDuringLoading",
-                            Qt.QueuedConnection
-                        )
-                        # No direct way to stop the GPT thread; it will complete in background
-                        break
-                    time.sleep(0.1)  # Check every 100ms
-
-                print(f"Returning to listen mode. Say '{WAKE_WORD}' again to wake me.")
-            else:
-                print("False alarm. Back to listening...")
-    except KeyboardInterrupt:
-        print("\nCtrl+C detected in assistant loop. Exiting.")
-        return
-    except Exception as e:
-        print(f"Unexpected error in assistant loop: {e}")
-        return
-
-
-def process_gpt(user_text, window, interrupt_event):
-    """
-    Processes GPT completion. If interrupted, it will still complete but the UI will have been updated.
-    """
-    response = get_chat_completion(user_text)
-    if not interrupt_event.is_set():
-        print(f"{ASSISTANT_NAME} says: {response}")
-
-        # Send GPT response to the GUI for progressive display
-        QMetaObject.invokeMethod(
-            window,
-            "showGPTResponse",
-            Qt.QueuedConnection,
-            Q_ARG(str, response)
-        )
+        ACTIVE_THREAD = OPENAI_CLIENT.beta.threads.create()
+        print(f"Created new thread: {ACTIVE_THREAD.id}")
     else:
-        print("GPT response received but was interrupted.")
+        print(f"Continuing thread: {ACTIVE_THREAD.id}")
+    return ACTIVE_THREAD
+
+
+def process_gpt_stream(user_text, window, interrupt_event):
+    """
+    This function uses OpenAI's beta.threads streaming to produce the final text.
+    If the user interrupts (wake word triggered), we set interrupt_event, which
+    leads us to break out. Then the old run finishes in the background, but we
+    simply ignore it from the UI side.
+    """
+    thread_obj = create_or_continue_thread()
+
+    accumulated_text = []
+    # We do the run streaming:
+    try:
+        with OPENAI_CLIENT.beta.threads.runs.stream(
+            thread_id=thread_obj.id,
+            assistant_id=ASSISTANT_ID,
+            instructions=user_text
+        ) as stream:
+            for e in stream:
+
+                # print(e)
+                # sys.exit(0)
+                if interrupt_event.is_set():
+                    print("Interrupt event set; stopping streaming early.")
+                    break
+
+                if e.event == "thread.message.delta" and e.data.delta.content:
+                    # The chunk is event.data.delta.content[0].text, which is a list of text segments
+                    for seg in e.data.delta.content:
+                        accumulated_text.append(seg.text.value)
+                        # We'll push partial text updates to the overlay as we go
+                        partial_text = "".join(accumulated_text)
+                        QMetaObject.invokeMethod(
+                            window.response_overlay,
+                            "appendOverlay",
+                            Qt.QueuedConnection,
+                            Q_ARG(str, seg.text.value)
+                        )
+
+                elif e.event == "thread.run.completed":
+                    # The run is complete
+                    break
+
+        final_text = "".join(accumulated_text).strip()
+        if not interrupt_event.is_set():
+            # If not interrupted, show final text
+            QMetaObject.invokeMethod(
+                window,
+                "showGPTResponse",
+                Qt.QueuedConnection,
+                Q_ARG(str, final_text)
+            )
+        else:
+            print("GPT run completed but we had an interrupt. Ignored final response.")
+    except Exception as e:
+        print(f"Error in process_gpt_stream: {e}")
+        # Fallback in UI
+        if not interrupt_event.is_set():
+            error_msg = selected_lang_dict["error_sentence"]
+            QMetaObject.invokeMethod(
+                window,
+                "showGPTResponse",
+                Qt.QueuedConnection,
+                Q_ARG(str, error_msg)
+            )
 
 
 def listen_for_wake_during_gpt(pa, interrupt_event):
     """
-    Listens for the wake word during GPT loading.
-    If detected, sets the interrupt_event to signal GPT loading interruption.
+    Identical logic to before. If we hear the wake word, we set the interrupt_event
+    so that process_gpt_stream stops streaming.
     """
     try:
         stream = pa.open(
@@ -1352,13 +1178,88 @@ def listen_for_wake_during_gpt(pa, interrupt_event):
                     interrupt_event.set()
                     break
     except KeyboardInterrupt:
-        print("KeyboardInterrupt caught in listen_for_wake_during_gpt.")
+        print("KeyboardInterrupt in listen_for_wake_during_gpt.")
     except Exception as e:
         print(f"Error in listen_for_wake_during_gpt: {e}")
     finally:
         decoder.end_utt()
         stream.stop_stream()
         stream.close()
+
+
+def assistant_loop(window, pa, interrupt_event):
+    print(f"{ASSISTANT_NAME} started. Listening for wake word: '{WAKE_WORD}'")
+    try:
+        while True:
+            buffered_audio = listen_for_potential_wake(pa)
+            if buffered_audio is None:
+                print("Failed capturing audio. Loop restart.")
+                continue
+
+            print("Potential wake word detected. Confirming...")
+            if confirm_wake_word(pa, buffered_audio, additional_time=0.2):
+                print("Wake word confirmed! I'm awake!")
+                QMetaObject.invokeMethod(
+                    window,
+                    "wakeWordDetected",
+                    Qt.QueuedConnection
+                )
+
+                recorded_wav = record_command(
+                    pa,
+                    aggressiveness=VAD_AGGRESSIVENESS,
+                    frame_duration=30,
+                    padding_duration=SILENCE_PADDING_DURATION_MS
+                )
+                if recorded_wav is None:
+                    print("Failed to record command. Return to listening.")
+                    window.dots_bowl.setState("LISTENING")
+                    continue
+
+                user_text = transcribe_audio(recorded_wav)
+                print(f"User said: {user_text}")
+
+                QMetaObject.invokeMethod(
+                    window,
+                    "startGptLoading",
+                    Qt.QueuedConnection
+                )
+
+                interrupt_event.clear()
+                gpt_thread = threading.Thread(
+                    target=process_gpt_stream,
+                    args=(user_text, window, interrupt_event),
+                    daemon=True
+                )
+                gpt_thread.start()
+
+                wake_during_gpt_thread = threading.Thread(
+                    target=listen_for_wake_during_gpt,
+                    args=(pa, interrupt_event),
+                    daemon=True
+                )
+                wake_during_gpt_thread.start()
+
+                while gpt_thread.is_alive():
+                    if interrupt_event.is_set():
+                        print("GPT loading interrupted by wake word.")
+                        QMetaObject.invokeMethod(
+                            window,
+                            "wakeWordDetectedDuringLoading",
+                            Qt.QueuedConnection
+                        )
+                        break
+                    time.sleep(0.1)
+
+                print(f"Returning to listen mode. Say '{WAKE_WORD}' again to wake me.")
+            else:
+                print("False alarm. Back to listening...")
+    except KeyboardInterrupt:
+        print("\nCtrl+C in assistant loop. Exiting.")
+        return
+    except Exception as e:
+        print(f"Unexpected error in assistant_loop: {e}")
+        return
 
 
 def main():
@@ -1369,8 +1270,10 @@ def main():
         window = SoundBowlWindow(pa)
         window.show()
 
-        # Assistant in background
-        assistant_thread = threading.Thread(target=assistant_loop, args=(window, pa, interrupt_event), daemon=True)
+        # Start assistant in background thread
+        assistant_thread = threading.Thread(
+            target=assistant_loop, args=(window, pa, interrupt_event), daemon=True
+        )
         assistant_thread.start()
 
         sys.exit(app.exec_())
